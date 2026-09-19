@@ -52,6 +52,15 @@ def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
+class _LegacySelfNorm(nn.Module):
+    """Preserve unused source checkpoint keys for strict historical loading."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.g_fc = nn.Conv1d(channels, channels, kernel_size=2, bias=False, groups=channels)
+        self.g_bn = nn.BatchNorm1d(channels)
+
+
 class BasicBlock(nn.Module):
     expansion: int = 1
 
@@ -178,12 +187,18 @@ class ResNet(nn.Module):
             input_channel_num: int = 48,
             output_use_sigmoid: bool = True,
             is_attribution: bool = False,
+            backbone_width: int = 128,
     ) -> None:
         super(ResNet, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
         self.input_channel_num = input_channel_num
+        if backbone_width not in (128, 256):
+            raise ValueError("MorphX backbone_width must be 128 (HCC) or 256 (LUAD).")
+        self.backbone_width = backbone_width
+        # Both source implementations use a 128-channel stem; LUAD widens at
+        # layer1, whereas HCC keeps 128 channels there.
         self.inplanes = 128
         self.dilation = 1
         self.feature_dim = feature_dim
@@ -200,6 +215,7 @@ class ResNet(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
         self.bn0 = norm_layer(self.input_channel_num)
+        self.selfnorm = _LegacySelfNorm(self.input_channel_num)
 
         self.lamda = 1e-5
         self.att_sigmoid = nn.Sigmoid()
@@ -220,15 +236,15 @@ class ResNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(block, 128, layers[0])
-        self.layer2 = self._make_layer(block, 256, layers[1], stride=2,
+        self.layer1 = self._make_layer(block, backbone_width, layers[0])
+        self.layer2 = self._make_layer(block, backbone_width * 2, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 512, layers[2], stride=2,
+        self.layer3 = self._make_layer(block, backbone_width * 4, layers[2], stride=2,
                                        dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 1024, layers[3], stride=2,
+        self.layer4 = self._make_layer(block, backbone_width * 8, layers[3], stride=2,
                                        dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(1024 * block.expansion, self.feature_dim)
+        self.fc = nn.Linear(backbone_width * 8 * block.expansion, self.feature_dim)
 
         self.bn2 = nn.BatchNorm1d(self.feature_dim)
         self.relu2 = nn.ReLU()
@@ -452,5 +468,3 @@ def wide_resnet101_2(pretrained: bool = False, progress: bool = True, **kwargs: 
     kwargs['width_per_group'] = 64 * 2
     return _resnet('wide_resnet101_2', Bottleneck, [3, 4, 23, 3],
                    pretrained, progress, **kwargs)
-
-

@@ -1,72 +1,131 @@
-import glob
-import os
-import numpy as np
+"""Concatenate tissue, texture, and nuclear feature-map families.
+
+The output channel order is fixed by :mod:`configs.cohorts`:
+``tissue -> texture -> nuclear``.  This order matches the supplied
+``feats_HCC.cvs`` and ``feats_LUNG.cvs`` metadata files.
+"""
+
+import argparse
 import json
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence
+
+import cv2
+import numpy as np
+
+from configs.cohorts import get_cohort, parse_feature_families
 
 
-def concat_feature_maps(wsi_names, tissue_type_maps_dir, feature_maps_dir_list, save_features_concat_dir, use_tissue):
+def _load_names(path: Path) -> List[str]:
+    with path.open("r", encoding="utf-8-sig") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, dict):
+        for key in ("all_data", "data", "wsi_names"):
+            if key in payload:
+                payload = payload[key]
+                break
+    if not isinstance(payload, list):
+        raise ValueError(f"{path} must contain a JSON list of feature-map filenames.")
+    return [str(value) for value in payload]
 
-    os.makedirs(save_features_concat_dir, exist_ok=True)
 
-    finished_maps = glob.glob(save_features_concat_dir+'/*')
-    for wsi_name in wsi_names:
-        if any(wsi_name in s for s in finished_maps) == True:
-            print(wsi_name + ' has finished!')
+def _load_family(directory: Path, name: str, expected_channels: int) -> np.ndarray:
+    path = directory / name
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing feature map: {path}")
+    values = np.asarray(np.load(path), dtype=np.float32)
+    if values.ndim == 2:
+        values = values[..., np.newaxis]
+    if values.ndim != 3:
+        raise ValueError(f"{path} must be HWC, got shape {values.shape}")
+    if values.shape[-1] != expected_channels:
+        raise ValueError(
+            f"{path} has {values.shape[-1]} channels; expected {expected_channels}."
+        )
+    return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _resize(values: np.ndarray, height: int, width: int, interpolation: int) -> np.ndarray:
+    if values.shape[:2] == (height, width):
+        return values
+    return cv2.resize(values, (width, height), interpolation=interpolation)
+
+
+def concat_feature_maps(
+    wsi_names: Iterable[str],
+    cohort: str,
+    output_dir: Path,
+    feature_families: str = "all",
+    tissue_dir: Optional[Path] = None,
+    texture_dir: Optional[Path] = None,
+    nuclear_dir: Optional[Path] = None,
+    overwrite: bool = False,
+) -> None:
+    """Create one ordered HWC feature map per WSI."""
+
+    spec = get_cohort(cohort)
+    _, selected_families = parse_feature_families(feature_families, spec)
+    directories: Dict[str, Optional[Path]] = {
+        "tissue": tissue_dir,
+        "texture": texture_dir,
+        "nuclear": nuclear_dir,
+    }
+    for family in selected_families:
+        if directories[family] is None:
+            raise ValueError(f"--{family}-dir is required for selected family {family!r}.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in wsi_names:
+        output_path = output_dir / name
+        if output_path.exists() and not overwrite:
             continue
-        try:
-            tissue_type_maps = np.load(os.path.join(tissue_type_maps_dir, wsi_name))
-        except Exception as e:
-            print(e)
-            continue
-        tissue_type_maps_row, tissue_type_maps_col = tissue_type_maps.shape[0], tissue_type_maps.shape[1]
-        if use_tissue == True:
-            tissue_type_maps_list = [tissue_type_maps[:, :, i] for i in range(tissue_type_maps.shape[-1])]
-        else:
-            tissue_type_maps_list = []
+        arrays: Dict[str, np.ndarray] = {}
+        for family in selected_families:
+            arrays[family] = _load_family(
+                directories[family], name, spec.family_sizes[family]
+            )
 
-        for feature_maps_dir in feature_maps_dir_list:
-            feature_imgs = np.load(os.path.join(feature_maps_dir, wsi_name))
-            feature_imgs_row, feature_imgs_col = feature_imgs.shape[0], feature_imgs.shape[1]
-            if tissue_type_maps_row != feature_imgs_row or tissue_type_maps_col != feature_imgs_col:
-                feature_imgs = np.resize(feature_imgs, (tissue_type_maps_row, tissue_type_maps_col, feature_imgs.shape[-1]))
-            feature_imgs_list = [feature_imgs[:, :, i] for i in range(feature_imgs.shape[-1])]
-            tissue_type_maps_list.extend(feature_imgs_list)
-
-        concated_features = np.stack(tissue_type_maps_list, axis=2)
-        np.save(os.path.join(save_features_concat_dir, wsi_name), concated_features)
+        reference = arrays[selected_families[0]]
+        height, width = reference.shape[:2]
+        channels = []
+        for family in selected_families:
+            interpolation = cv2.INTER_NEAREST if family == "tissue" else cv2.INTER_LINEAR
+            values = _resize(arrays[family], height, width, interpolation)
+            channels.append(values)
+        merged = np.concatenate(channels, axis=-1).astype(np.float32, copy=False)
+        expected = sum(spec.family_sizes[family] for family in selected_families)
+        if merged.shape[-1] != expected:
+            raise RuntimeError(f"Internal channel mismatch for {name}: {merged.shape[-1]} != {expected}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output_path, merged)
 
 
-if __name__ == '__main__':
-
-    data_set = 'TCGA'
-    base_dir = f'HCC_path/{data_set}'
-
-    channel_num = 160
-    use_tissue = True
-    if channel_num == 48:
-        feature_maps_dir_list = [
-            f'{base_dir}/processed_data/feature_maps/hand-crafted/texture_feature_maps']
-    elif channel_num == 168:
-        feature_maps_dir_list = [f'{base_dir}/processed_data/feature_maps/hand-crafted/texture_feature_maps',
-                                 f'{base_dir}/processed_data/feature_maps/hand-crafted/nucleus_feature_maps']
-    elif channel_num == 160:
-        feature_maps_dir_list = [f'{base_dir}/processed_data/feature_maps/hand-crafted/texture_feature_maps',
-                                 f'{base_dir}/processed_data/feature_maps/hand-crafted/nucleus_feature_maps']
-        use_tissue = False
-    elif channel_num == 128:
-        feature_maps_dir_list = [
-                                 f'{base_dir}/processed_data/feature_maps/hand-crafted/nucleus_feature_maps']
-
-    tissue_type_maps_dir = f'{base_dir}/processed_data/feature_maps/tissue_type/tissue_type_maps'
-    tissue_mask_dir = f'{base_dir}/processed_data/histoqc'
-    save_features_concat_dir = f'{base_dir}/processed_data/feature_maps/concat_feature_maps/{channel_num}d/initial/concat_feature_maps'
-    with open(os.path.join(f'{base_dir}/all_data.json'), 'r', encoding='utf-8-sig') as f:
-        wsi_names = json.load(f)
-
-    concat_feature_maps(wsi_names, tissue_type_maps_dir, feature_maps_dir_list, save_features_concat_dir, use_tissue)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Concatenate MorphX feature-map families.")
+    parser.add_argument("--cohort", choices=("hcc", "luad"), required=True)
+    parser.add_argument("--wsi-list", type=Path, required=True, help="JSON list such as all_data.json.")
+    parser.add_argument("--tissue-dir", type=Path, default=None)
+    parser.add_argument("--texture-dir", type=Path, default=None)
+    parser.add_argument("--nuclear-dir", type=Path, default=None)
+    parser.add_argument("--feature-families", default="all", help="all or legacy sizes, e.g. 8+40.")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser
 
 
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = build_parser().parse_args(argv)
+    concat_feature_maps(
+        _load_names(args.wsi_list),
+        args.cohort,
+        args.output_dir,
+        args.feature_families,
+        args.tissue_dir,
+        args.texture_dir,
+        args.nuclear_dir,
+        args.overwrite,
+    )
 
 
-
-
+if __name__ == "__main__":
+    main()

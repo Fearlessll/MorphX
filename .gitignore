@@ -1,0 +1,31 @@
+# Data and experiment outputs
+data/
+runs/
+checkpoints/
+results/
+demo/output/
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.svs
+*.ndpi
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+*.egg-info/
+build/
+dist/
+
+# Local environment files
+.env
+.venv/
+venv/

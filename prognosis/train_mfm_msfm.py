@@ -1,527 +1,514 @@
-import statistics
+"""Unified MFM/MSFM training entry point for HCC and LUAD.
+
+Examples:
+
+    python -m prognosis.train_mfm_msfm \
+        --cohort hcc --dataset tcga --data-root /data/HCC_path \
+        --feature-families all --model macro
+
+    python -m prognosis.train_mfm_msfm \
+        --cohort luad --dataset tcga --data-root /data/LUNG_path \
+        --feature-families all --model fusion \
+        --micro-feature-template /data/micro/fold_{fold}.csv
+"""
+
+import argparse
 import json
 import random
-from torch.utils.data import WeightedRandomSampler
-from tqdm import tqdm
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
-import torch.optim.lr_scheduler as lr_scheduler
-from Networks.darknet import darknet53
-from Networks.vit import VisionTransformer
-from Networks.resnet import resnet10, resnext50_32x4d, resnet18
-from Networks.resnet_norm import resnet9 as resnet_norm
-from Networks.resnet3D import resnet10 as resnet3d
-from Networks.CNN import SimpleCNN
-from Networks.fusion_net import FusionNet
-from data_loaders import MyDataset, MyFusionDataset
-from utils import cox_loss, modified_cox_loss, cindex_lifeline, cox_log_rank, accuracy_cox, count_parameters
-import argparse
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import pandas as pd
-import os
-import pickle
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
+from configs.cohorts import CohortSpec, default_dataset_dir, default_wsi_list_path, get_cohort, parse_feature_families
+from prognosis.clinical import load_survival_labels
+from prognosis.data_loaders import FusionFeatureMapDataset, MacroFeatureMapDataset
+from prognosis.Networks.fusion_net import FusionNet
+from prognosis.Networks.resnet import resnet10
+from prognosis.utils import cindex_lifeline, count_parameters, cox_log_rank, cox_loss, modified_cox_loss
 
 
-def get_excel_data_TCGA(dataset):
-    data = pd.read_csv('HCC_path/TCGA/TCGA.csv')
-    censors = []
-    survivetimes = []
-    for seg_filepath in dataset:
-        if seg_filepath[0:4] == 'TCGA':
-            ID = seg_filepath.split('.')[0][0:23]
-        else:
-            ID = seg_filepath.split('-')[0]
-        data['WSIs'] = data['WSIs'].astype(str)
-        pd_index = data[data['WSIs'].isin([ID])].index.values[0]
-        if data['vital_status'][pd_index] == 1:
-            T = data['days_to_last_follow_up'][pd_index] / 30
-        else:
-            T = data['days_to_death'][pd_index] / 30
-        O = (~data['vital_status'][pd_index].astype(bool)).astype(int)
-        censors.append(O)
-        survivetimes.append(T)
-    return censors, survivetimes
-
-
-def get_excel_data_CohortLIHC(dataset):
-    data = pd.read_csv('HCC_path/CohortLIHC/CohortLIHC_data.csv')
-    censors = []
-    survivetimes = []
-    for seg_filepath in dataset:
-        ID = seg_filepath.split('-')[0]
-        data['WSIs'] = data['WSIs'].astype(str)
-        pd_index = data[data['WSIs'].isin([ID])].index.values[0]
-        T = data['OS'][pd_index] / 30
-        O = (data['OS_status'][pd_index].astype(bool)).astype(int)
-        censors.append(O)
-        survivetimes.append(T)
-    return censors, survivetimes
-
-
-def get_dataset_survival_data(dataset, data_set_name):
-    """Get survival data based on dataset name"""
-    if data_set_name == 'TCGA':
-        return get_excel_data_TCGA(dataset)
-    elif data_set_name == 'CohortLIHC':
-        return get_excel_data_CohortLIHC(dataset)
-    else:
-        raise ValueError(f"Unknown dataset name: {data_set_name}")
-
-
-def initialize_model(args):
-    """Initialize model based on model type (macro or fusion)"""
-    if args.model_name == 'macro':
-        model = resnet10(
-            first_covd_param=args.macro_first_covd_param,
-            input_channel_num=args.macro_input_channel_num,
-            output_use_sigmoid=args.output_use_sigmoid
-        )
-    elif args.model_name == 'fusion':
-        model = FusionNet(
-            macro_first_covd_param=args.macro_first_covd_param,
-            macro_input_channel_num=args.macro_input_channel_num,
-            output_use_sigmoid=args.output_use_sigmoid,
-            macro_best_ckpt_path=args.macro_best_ckpt_path
-        )
-        if args.freeze_macro_part:
-            for name, param in model.macro_net.named_parameters():
-                param.requires_grad = False
-    else:
-        raise ValueError(f"Unknown model name: {args.model_name}")
-
-    return model.to(args.device)
-
-
-def initialize_data_loaders(train_data, test_data, train_censors, train_sruvivetimes,
-                            test_censors, test_sruvivetimes, args):
-    """Initialize data loaders based on model type"""
-    transform = A.Compose([
-        A.Resize(args.input_size, args.input_size),
-        ToTensorV2(),
-    ])
-
-    # Prepare full paths
-    train_data = [os.path.join(args.final_save_dir, wsi_name) for wsi_name in train_data]
-    test_data = [os.path.join(args.final_save_dir, wsi_name) for wsi_name in test_data]
-
-    if args.model_name == 'macro':
-        train_dataset = MyDataset(train_data, train_censors, train_sruvivetimes, transform=transform)
-        test_dataset = MyDataset(test_data, test_censors, test_sruvivetimes, transform=transform)
-    elif args.model_name == 'fusion':
-        train_dataset = MyFusionDataset(
-            train_data, train_censors, train_sruvivetimes,
-            args.patchs_feats_file if hasattr(args, 'patchs_feats_file') else args.mircro_dir,
-            args.macro_input_channel_num,
-            transform=transform
-        )
-        test_dataset = MyFusionDataset(
-            test_data, test_censors, test_sruvivetimes,
-            args.patchs_feats_file if hasattr(args, 'patchs_feats_file') else args.mircro_dir,
-            args.macro_input_channel_num,
-            transform=transform
-        )
-
-    # Create weighted samplers for class imbalance
-    def create_sampler(dataset, censors):
-        label_to_count = {}
-        for label in censors:
-            label_to_count[label] = label_to_count.get(label, 0) + 1
-        weight_for_0 = len(dataset) / float(label_to_count[0])
-        weight_for_1 = len(dataset) / float(label_to_count[1])
-        class_weights = [weight_for_0 if label == 0 else weight_for_1 for label in censors]
-        return WeightedRandomSampler(class_weights, len(class_weights), replacement=False)
-
-    train_sampler, _ = create_sampler(train_dataset, train_censors)
-    test_sampler, _ = create_sampler(test_dataset, test_censors)
-
-    train_loader = torch.utils.data.DataLoader(
-        dataset=train_dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        drop_last=False,
-        num_workers=4
-    )
-
-    test_loader = torch.utils.data.DataLoader(
-        dataset=test_dataset,
-        batch_size=args.batch_size,
-        sampler=test_sampler,
-        shuffle=False,
-        drop_last=False,
-        num_workers=4
-    )
-
-    return train_loader, test_loader
-
-
-def train_epoch(model, train_loader, loss_function, optimizer, scheduler, args):
-    """Train model for one epoch"""
-    model.train()
-    risk_pred_all, censor_all, survtime_all = np.array([]), np.array([]), np.array([])
-    loss_epoch = 0
-
-    for batch_idx, (x_path, survtime, censor) in enumerate(train_loader):
-        censor = censor.to(args.device)
-
-        if args.model_name == "macro":
-            macro_path = x_path.to(args.device).float()
-            with autocast(enabled=False):
-                _, pred = model(macro_path)
-                loss_cox = loss_function(survtime, censor, pred, args.device)
-        elif args.model_name == "fusion":
-            imgs_path = x_path[0].to(args.device).float()
-            macro_path = x_path[1].to(args.device).float()
-            with autocast(enabled=False):
-                pred = model(imgs_path, macro_path)
-                loss_cox = loss_function(survtime, censor, pred, args.device)
-
-        loss = loss_cox
-        loss_epoch += loss.data.item()
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # Logging information
-        risk_pred_all = np.concatenate((risk_pred_all, pred.detach().cpu().numpy().reshape(-1)))
-        censor_all = np.concatenate((censor_all, censor.detach().cpu().numpy().reshape(-1)))
-        survtime_all = np.concatenate((survtime_all, survtime.detach().cpu().numpy().reshape(-1)))
-
-    scheduler.step(loss_epoch)
-    lr = optimizer.param_groups[0]['lr']
-    print(f'learning rate = {lr:.7f}')
-    print('-----------------------------------------------------------------------------------------')
-
-    loss_epoch /= len(train_loader.dataset)
-    cindex_epoch = cindex_lifeline(risk_pred_all, censor_all, survtime_all)
-    pvalue_epoch = cox_log_rank(risk_pred_all, censor_all, survtime_all)
-    surv_acc_epoch = accuracy_cox(risk_pred_all, censor_all)
-
-    return loss_epoch, cindex_epoch, pvalue_epoch, surv_acc_epoch
-
-
-def test(model, test_loader, loss_function, args):
-    """Evaluate model on test set"""
-    model.eval()
-    risk_pred_all, censor_all, survtime_all = np.array([]), np.array([]), np.array([])
-    loss_test = 0
-
-    with torch.no_grad():
-        for batch_idx, (x_path, survtime, censor) in enumerate(test_loader):
-            censor = censor.to(args.device)
-
-            if args.model_name == "macro":
-                macro_path = x_path.to(args.device).float()
-                with autocast(enabled=False):
-                    _, pred = model(macro_path)
-                    loss_cox = loss_function(survtime, censor, pred, args.device)
-            elif args.model_name == "fusion":
-                imgs_path = x_path[0].to(args.device).float()
-                macro_path = x_path[1].to(args.device).float()
-                with autocast(enabled=False):
-                    pred = model(imgs_path, macro_path)
-                    loss_cox = loss_function(survtime, censor, pred, args.device)
-
-            loss_test += loss_cox.data.item()
-
-            risk_pred_all = np.concatenate((risk_pred_all, pred.detach().cpu().numpy().reshape(-1)))
-            censor_all = np.concatenate((censor_all, censor.detach().cpu().numpy().reshape(-1)))
-            survtime_all = np.concatenate((survtime_all, survtime.detach().cpu().numpy().reshape(-1)))
-
-    loss_test /= len(test_loader.dataset)
-    cindex_test = cindex_lifeline(risk_pred_all, censor_all, survtime_all)
-    pvalue_test = cox_log_rank(risk_pred_all, censor_all, survtime_all)
-    surv_acc_test = accuracy_cox(risk_pred_all, censor_all)
-
-    pred_test = [risk_pred_all, survtime_all, censor_all, None, None]
-
-    return loss_test, cindex_test, pvalue_test, surv_acc_test, None, pred_test
-
-
-def train(train_data, test_data, k_th_fold, args):
-    """Main training function for one fold"""
-    print(args.device)
-    cindex_test_max = 0
-
-    seed = int(2024)
+def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # Get survival data
-    train_censors, train_sruvivetimes = get_dataset_survival_data(train_data, args.data_set_name)
-    test_censors, test_sruvivetimes = get_dataset_survival_data(test_data, args.data_set_name)
 
-    # Initialize model and data loaders
-    model = initialize_model(args)
-    train_loader, test_loader = initialize_data_loaders(
-        train_data, test_data,
-        train_censors, train_sruvivetimes,
-        test_censors, test_sruvivetimes,
-        args
+def _json_default(value):
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Cannot serialize {type(value)!r}")
+
+
+def _load_split(split_dir: Path, fold: int) -> Tuple[List[str], List[str]]:
+    split_path = split_dir / f"split_data_fold_{fold}.json"
+    if not split_path.is_file():
+        raise FileNotFoundError(f"Fixed split file does not exist: {split_path}")
+    with split_path.open("r", encoding="utf-8-sig") as handle:
+        payload = json.load(handle)
+    train = payload.get("train_data")
+    validation = payload.get("test_data", payload.get("val_data"))
+    if not isinstance(train, list) or not isinstance(validation, list):
+        raise ValueError(f"Split file must contain train_data and test_data lists: {split_path}")
+    if not train or not validation or len(set(train)) != len(train) or len(set(validation)) != len(validation):
+        raise ValueError(f"Split has empty or duplicate entries: {split_path}")
+    if set(train) & set(validation):
+        raise ValueError(f"Training and validation overlap in {split_path}")
+    return train, validation
+
+
+def _resolve_feature_paths(names: Iterable[str], feature_map_dir: Path) -> List[str]:
+    paths = []
+    missing = []
+    for name in names:
+        candidate = Path(name)
+        if not candidate.is_absolute():
+            candidate = feature_map_dir / candidate
+        if not candidate.is_file():
+            missing.append(str(candidate))
+        paths.append(str(candidate))
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} feature maps are missing under {feature_map_dir}; examples: {missing[:5]}"
+        )
+    return paths
+
+
+def _default_feature_map_dir(
+    data_root: Path, cohort: CohortSpec, dataset: str, image_size: int
+) -> Path:
+    dataset_dir = default_dataset_dir(data_root, cohort, dataset)
+    base = (
+        dataset_dir
+        / "processed_data"
+        / "feature_maps"
+        / "concat_feature_maps"
+        / f"{cohort.total_channels}d"
+    )
+    candidates = [
+        base / "initial" / "final_feature_maps" / str(image_size),
+        base / "initial_tumour" / "final_feature_maps_new" / str(image_size),
+    ]
+    present = [candidate for candidate in candidates if candidate.is_dir()]
+    if len(present) == 1:
+        return present[0]
+    raise FileNotFoundError(
+        f"Expected one processed {cohort.total_channels}-channel {image_size}x{image_size} "
+        f"feature-map directory under {base}; found {present}. Set --feature-map-dir explicitly."
     )
 
-    # Initialize optimizer and scheduler
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=4e-4)
-    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.9, threshold=0.01, patience=1)
-    print(f"Number of Trainable Parameters: {count_parameters(model)}")
 
-    # Initialize metric logger
-    metric_logger = {
-        'train': {'loss': [], 'pvalue': [], 'cindex': [], 'surv_acc': [], 'grad_acc': []},
-        'test': {'loss': [], 'pvalue': [], 'cindex': [], 'surv_acc': [], 'grad_acc': []},
-        'val': {'loss': [], 'pvalue': [], 'cindex': [], 'surv_acc': [], 'grad_acc': []}
+def _format_template(template: Optional[str], fold: int) -> Optional[Path]:
+    if not template:
+        return None
+    return Path(template.format(fold=fold))
+
+
+def _build_model(args, input_channels: int, macro_checkpoint: Optional[Path] = None):
+    spec = get_cohort(args.cohort)
+    if args.model == "macro":
+        return resnet10(
+            first_covd_param=args.first_conv,
+            input_channel_num=input_channels,
+            output_use_sigmoid=getattr(args, "train_output", "sigmoid") == "sigmoid",
+            backbone_width=spec.backbone_width,
+        )
+    model = FusionNet(
+        macro_first_covd_param=args.first_conv,
+        macro_input_channel_num=input_channels,
+        micro_feature_dim=args.micro_feature_dim,
+        macro_feature_dim=spec.backbone_width * 8,
+        backbone_width=spec.backbone_width,
+        macro_best_ckpt_path=str(macro_checkpoint) if macro_checkpoint else None,
+        output_use_sigmoid=True,
+    )
+    if getattr(args, "freeze_macro", False):
+        for parameter in model.macro_net.parameters():
+            parameter.requires_grad = False
+    return model
+
+
+def _make_dataset(
+    args,
+    paths: Sequence[str],
+    events: np.ndarray,
+    times: np.ndarray,
+    channel_indices: Sequence[int],
+):
+    if args.model == "macro":
+        return MacroFeatureMapDataset(
+            paths,
+            events,
+            times,
+            channel_indices=channel_indices,
+            image_size=args.image_size,
+        )
+    micro_csv = (args.micro_features_csv if args.stage == "final"
+                 else _format_template(args.micro_feature_template, args.current_fold))
+    if micro_csv is None:
+        raise ValueError("--micro-feature-template is required for fusion training.")
+    return FusionFeatureMapDataset(
+        paths,
+        events,
+        times,
+        micro_features_csv=micro_csv,
+        micro_feature_dim=args.micro_feature_dim,
+        channel_indices=channel_indices,
+        image_size=args.image_size,
+    )
+
+
+def _predict(model, loader, device, model_type: str):
+    model.eval()
+    # The historical training loss consumes sigmoid output; risk analyses use
+    # the pre-sigmoid score from the same head.
+    previous = model.output_use_sigmoid
+    model.output_use_sigmoid = False
+    risks, times, events = [], [], []
+    try:
+        with torch.no_grad():
+            for inputs, batch_times, batch_events in loader:
+                if model_type == "macro":
+                    scores = model(inputs.to(device).float())[1]
+                else:
+                    micro, macro = inputs
+                    scores = model(micro.to(device).float(), macro.to(device).float())
+                risks.append(scores.reshape(-1).cpu().numpy())
+                times.append(batch_times.numpy())
+                events.append(batch_events.numpy())
+    finally:
+        model.output_use_sigmoid = previous
+    return (
+        np.concatenate(risks),
+        np.concatenate(times),
+        np.concatenate(events),
+    )
+
+
+def _evaluate(model, loader, device, model_type: str) -> Dict[str, float]:
+    risk, times, events = _predict(model, loader, device, model_type)
+    return {
+        "cindex": cindex_lifeline(risk, events, times),
+        "logrank_p": cox_log_rank(risk, events, times),
+        "n": int(len(risk)),
+        "events": int(events.sum()),
     }
 
-    # Loss function
-    loss_function = modified_cox_loss if args.loss_function == 'modified_cox_loss' else cox_loss
 
-    # Training loop
-    transform = A.Compose([A.Resize(args.input_size, args.input_size), ToTensorV2()])
+def _save_predictions(path: Path, names, risk, times, events) -> None:
+    import pandas as pd
 
-    for epoch in tqdm(range(args.epochs)):
-        # Freeze macro part if needed (for fusion model)
-        if args.model_name == 'fusion' and args.freeze_macro_part:
-            for name, param in model.macro_net.named_parameters():
-                param.requires_grad = False
-
-        # Train epoch
-        train_loss, train_cindex, train_pvalue, train_surv_acc = train_epoch(
-            model, train_loader, loss_function, optimizer, scheduler, args
-        )
-
-        # Evaluate on test set
-        test_loss, test_cindex, test_pvalue, test_surv_acc, _, pred_test = test(
-            model, test_loader, loss_function, args
-        )
+    pd.DataFrame(
+        {"wsi_name": [Path(name).name for name in names], "risk_score": risk,
+         "survival_months": times, "event": events.astype(int)}
+    ).to_csv(path, index=False)
 
 
-        # Update metric logger
-        metric_logger['train']['loss'].append(train_loss)
-        metric_logger['train']['cindex'].append(train_cindex)
-        metric_logger['train']['pvalue'].append(train_pvalue)
-        metric_logger['train']['surv_acc'].append(train_surv_acc)
+def train_fold(args, fold: int, device: torch.device, spec: CohortSpec, channel_indices):
+    args.current_fold = fold
+    train_names, validation_names = _load_split(args.splits_dir, fold)
+    train_paths = _resolve_feature_paths(train_names, args.feature_map_dir)
+    validation_paths = _resolve_feature_paths(validation_names, args.feature_map_dir)
 
-        metric_logger['test']['loss'].append(test_loss)
-        metric_logger['test']['cindex'].append(test_cindex)
-        metric_logger['test']['pvalue'].append(test_pvalue)
-        metric_logger['test']['surv_acc'].append(test_surv_acc)
-
-        # Print metrics
-        print(
-            f"[Train]\t\tLoss: {train_loss:.4f}, surv_acc: {train_surv_acc:.4f}, C-Index: {train_cindex:.4f}, p-value: {train_pvalue}")
-        print(
-            f"[Test]\t\tLoss: {test_loss:.4f}, surv_acc: {test_surv_acc:.4f}, C-Index: {test_cindex:.4f}, p-value: {test_pvalue}\n")
-
-        # Save checkpoint
-        save_path = os.path.join(
-            args.train_log_dir,
-            f'train_log_{args.data_set_name}_{args.input_size}_{args.model_name}_{args.input_data_type}/'
-            f'{k_th_fold}th'
-        )
-        os.makedirs(save_path, exist_ok=True)
-
-        if test_cindex > cindex_test_max:
-            cindex_test_max = test_cindex
-
-        torch.save({
-            'split': k_th_fold,
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'metrics': metric_logger
-        }, save_path + f'/{epoch}.pkl')
-
-        pickle.dump(pred_test, open(save_path + f'/pred_test_{k_th_fold}.pkl', 'wb'))
-
-    return model, optimizer, metric_logger
-
-
-def calculate_average_cindex(args):
-    """Calculate average C-index across all folds"""
-    train_log_base_dir = os.path.join(
-        args.train_log_dir,
-        f'train_log_{args.data_set_name}_{args.input_size}_{args.model_name}_{args.input_data_type}'
+    train_events, train_times = load_survival_labels(
+        train_names, spec, args.dataset, data_root=args.data_root, clinical_csv=args.clinical_csv
     )
-    max_cindex_list = []
-    max_cindex_index_list = []
+    validation_events, validation_times = load_survival_labels(
+        validation_names, spec, args.dataset, data_root=args.data_root, clinical_csv=args.clinical_csv
+    )
+    train_set = _make_dataset(args, train_paths, train_events, train_times, channel_indices)
+    validation_set = _make_dataset(
+        args, validation_paths, validation_events, validation_times, channel_indices
+    )
+    event_counts = np.bincount(train_events.astype(int), minlength=2)
+    sampling_weights = [1.0 / event_counts[int(value)] for value in train_events]
+    sampler = WeightedRandomSampler(sampling_weights, len(train_set), replacement=False)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=len(train_set) if args.batch_size <= 0 else args.batch_size,
+        sampler=sampler,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+    )
+    validation_loader = DataLoader(
+        validation_set,
+        batch_size=len(validation_set) if args.batch_size <= 0 else args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+    )
 
-    for i in range(args.k_fold):
-        epoch_last_pkl = torch.load(os.path.join(train_log_base_dir, f'{i}th/{args.epochs - 1}.pkl'))
-        start = 0
-        cindex_list = epoch_last_pkl['metrics']['test']['cindex'][start:]
-        pvalue_list = epoch_last_pkl['metrics']['test']['pvalue'][start:]
+    macro_checkpoint = _format_template(args.macro_checkpoint_template, fold)
+    if macro_checkpoint and not macro_checkpoint.is_file():
+        raise FileNotFoundError(f"Macro checkpoint does not exist: {macro_checkpoint}")
+    model = _build_model(args, len(channel_indices), macro_checkpoint).to(device)
+    optimizer = torch.optim.Adam(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.9, threshold=0.01, patience=1
+    )
+    output_dir = args.output_dir / f"fold_{fold}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    best_cindex = -float("inf")
+    history = []
 
-        flag = False
-        for j in range(len(cindex_list)):
-            max_cindex_value = max(cindex_list)
-            index = cindex_list.index(max_cindex_value) + start
-            if pvalue_list[index] < 0.95:
-                max_cindex_list.append(max_cindex_value)
-                max_cindex_index_list.append((round(max_cindex_value, 4), index))
-                flag = True
-                break
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0.0
+        for inputs, batch_times, batch_events in train_loader:
+            batch_times = batch_times.to(device)
+            batch_events = batch_events.to(device)
+            if args.model == "macro":
+                scores = model(inputs.to(device).float())[1]
             else:
-                del cindex_list[index]
-                del pvalue_list[index]
+                micro, macro = inputs
+                scores = model(micro.to(device).float(), macro.to(device).float())
+            loss_function = modified_cox_loss if args.loss_function == "source_modified" else cox_loss
+            loss = loss_function(batch_times, batch_events, scores)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += float(loss.detach().cpu())
 
-        if not flag:
-            max_cindex_index_list.append((0, 0))
+        scheduler.step(float(loss.detach().cpu()))
+        validation_metrics = _evaluate(model, validation_loader, device, args.model)
+        train_metrics = _evaluate(model, train_loader, device, args.model)
+        record = {
+            "epoch": epoch,
+            "train_loss": epoch_loss / max(len(train_loader), 1),
+            "train": train_metrics,
+            "validation": validation_metrics,
+        }
+        history.append(record)
+        score = validation_metrics["cindex"]
+        score_for_comparison = score if np.isfinite(score) else -float("inf")
+        checkpoint = {
+            "fold": fold,
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": vars(args),
+            "metrics": record,
+        }
+        torch.save(checkpoint, output_dir / "last.pt")
+        if epoch == 0 or score_for_comparison > best_cindex:
+            best_cindex = score_for_comparison
+            torch.save(checkpoint, output_dir / "best.pt")
+            risk, times, events = _predict(model, validation_loader, device, args.model)
+            _save_predictions(output_dir / "validation_predictions.csv", validation_names, risk, times, events)
+        print(
+            f"fold={fold} epoch={epoch + 1}/{args.epochs} "
+            f"loss={record['train_loss']:.5f} "
+            f"val_cindex={validation_metrics['cindex']:.4f}"
+        )
 
-        epoch_last_pkl = None
-        torch.cuda.empty_cache()
-
-    print('max_cindex')
-    print(max_cindex_list)
-    print(max_cindex_index_list)
-    print(f"Average: {round(sum(max_cindex_list) / len(max_cindex_list), 4)}")
-    print(f"Std: {round(statistics.stdev(max_cindex_list), 4)}")
+    with (output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump({"loss_function": args.loss_function, "history": history,
+                   "best_cindex": best_cindex}, handle, indent=2, default=_json_default)
+    return best_cindex
 
 
-def train_k_folds(args):
-    """Train model using k-fold cross validation"""
-    data_set_dir_list = [
-        "8", "40", "8+40", "8+120", "120", "40+120", "8+40+120"
-    ]
+def _median_optimal_epochs(cv_output_dir: Path, loss_function: str) -> int:
+    """Use discovery-fold validation results from the same loss protocol."""
 
-    if args.input_data_type not in data_set_dir_list:
-        raise ValueError(f"Invalid input_data_type. Must be one of: {data_set_dir_list}")
+    best_epochs = []
+    for fold in range(10):
+        path = cv_output_dir / f"fold_{fold}" / "metrics.json"
+        metrics = json.loads(path.read_text(encoding="utf-8"))
+        if metrics.get("loss_function") != loss_function:
+            raise ValueError(
+                f"Fold {fold} does not record --loss-function {loss_function}: {path}. "
+                "Rerun all ten discovery folds with the selected loss."
+            )
+        history = metrics["history"]
+        scores = np.asarray([row["validation"]["cindex"] for row in history], dtype=float)
+        if not np.isfinite(scores).any():
+            raise ValueError(f"No finite validation C-index for fold {fold}")
+        best_epochs.append(int(np.nanargmax(scores)) + 1)
+    return int(np.ceil(np.median(best_epochs)))
 
-    feature_num_arr = [int(f_num) for f_num in args.input_data_type.split('+')]
-    args.macro_input_channel_num = sum(feature_num_arr)
 
-    args.split_data_dir = f'{args.base_dir}/{args.data_set_name}'
+def train_final(args, device: torch.device, spec: CohortSpec, channel_indices):
+    """Fit one model on every discovery WSI, without consulting external data."""
 
-    # Parse best macro models from args
-    if args.model_name == 'fusion':
-        if not args.best_macro_models:
-            raise ValueError("For fusion model, best_macro_models must be provided")
+    list_path = default_wsi_list_path(args.data_root, spec, args.dataset)
+    with list_path.open("r", encoding="utf-8-sig") as handle:
+        names = json.load(handle)
+    if not isinstance(names, list) or not names or len(set(names)) != len(names):
+        raise ValueError(f"Malformed full-discovery WSI list: {list_path}")
+    paths = _resolve_feature_paths(names, args.feature_map_dir)
+    events, times = load_survival_labels(
+        names, spec, args.dataset, data_root=args.data_root, clinical_csv=args.clinical_csv
+    )
+    dataset = _make_dataset(args, paths, events, times, channel_indices)
+    counts = np.bincount(events.astype(int), minlength=2)
+    weights = [1.0 / counts[int(value)] for value in events]
+    sampler = WeightedRandomSampler(weights, len(dataset), replacement=False)
+    train_loader = DataLoader(dataset, batch_size=len(dataset) if args.batch_size <= 0 else args.batch_size,
+                              sampler=sampler, num_workers=args.workers, pin_memory=device.type == "cuda")
+    predict_loader = DataLoader(dataset, batch_size=len(dataset) if args.batch_size <= 0 else args.batch_size,
+                                shuffle=False, num_workers=args.workers, pin_memory=device.type == "cuda")
+    macro_checkpoint = args.macro_checkpoint if args.model == "fusion" else None
+    model = _build_model(args, len(channel_indices), macro_checkpoint).to(device)
+    optimizer = torch.optim.Adam((parameter for parameter in model.parameters() if parameter.requires_grad),
+                                 lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.9, threshold=0.01, patience=1
+    )
+    history = []
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0.0
+        for inputs, batch_times, batch_events in train_loader:
+            if args.model == "macro":
+                scores = model(inputs.to(device).float())[1]
+            else:
+                micro, macro = inputs
+                scores = model(micro.to(device).float(), macro.to(device).float())
+            loss_function = modified_cox_loss if args.loss_function == "source_modified" else cox_loss
+            loss = loss_function(batch_times.to(device), batch_events.to(device), scores)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach().cpu())
+        mean_loss = total_loss / len(train_loader)
+        scheduler.step(float(loss.detach().cpu()))
+        history.append({"epoch": epoch + 1, "train_loss": mean_loss})
+        print(f"final epoch={epoch + 1}/{args.epochs} loss={mean_loss:.5f}")
+    checkpoint = {"stage": "final", "epoch": args.epochs - 1, "model_state_dict": model.state_dict(),
+                  "optimizer_state_dict": optimizer.state_dict(), "config": vars(args), "history": history}
+    torch.save(checkpoint, args.output_dir / "final.pt")
+    risk, times, events = _predict(model, predict_loader, device, args.model)
+    _save_predictions(args.output_dir / "discovery_predictions.csv", names, risk, times, events)
+    (args.output_dir / "metrics.json").write_text(
+        json.dumps({"n": len(names), "epochs": args.epochs, "history": history}, indent=2),
+        encoding="utf-8",
+    )
 
-        # Parse string like "0:5,1:6,2:2,3:13,4:13,5:10,6:14,7:12,8:7,9:13"
-        best_macro_model = []
-        for pair in args.best_macro_models.split(','):
-            fold, epoch = pair.split(':')
-            best_macro_model.append((int(fold), int(epoch)))
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train MorphX MFM or MSFM survival models.")
+    parser.add_argument("--cohort", choices=("hcc", "luad"), required=True)
+    parser.add_argument("--dataset", choices=("tcga", "kmmufh", "gd"), required=True)
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--clinical-csv", type=Path, default=None)
+    parser.add_argument("--feature-map-dir", type=Path, default=None)
+    parser.add_argument("--splits-dir", type=Path, default=None)
+    parser.add_argument("--feature-families", default="all")
+    parser.add_argument("--model", choices=("macro", "fusion"), default="macro")
+    parser.add_argument("--stage", choices=("cv", "final"), default="cv")
+    parser.add_argument("--micro-feature-template", default=None)
+    parser.add_argument("--micro-features-csv", type=Path, default=None)
+    parser.add_argument("--micro-feature-dim", type=int, default=None)
+    parser.add_argument("--macro-checkpoint-template", default=None)
+    parser.add_argument("--macro-checkpoint", type=Path, default=None)
+    parser.add_argument("--freeze-macro", action="store_true")
+    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--first-conv", nargs=3, type=int, default=(3, 2, 1))
+    parser.add_argument("--folds", nargs="+", type=int, default=list(range(10)))
+    parser.add_argument("--epochs", type=int, default=None, help="Default follows the cohort and model protocol.")
+    parser.add_argument("--cv-output-dir", type=Path, default=None,
+                        help="For final stage, derive epochs from ten discovery CV folds.")
+    parser.add_argument("--batch-size", type=int, default=10, help="0 uses one full batch per fold.")
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--loss-function", choices=("cox", "source_modified"), default="cox",
+                        help="Default: standard Cox partial likelihood with Breslow ties and "
+                             "per-event mean reduction; source_modified reproduces the old two-term loss.")
+    parser.add_argument("--train-output", choices=("sigmoid", "logit"), default="sigmoid",
+                        help="Training score activation; logit enables the MFM no-sigmoid ablation.")
+    parser.add_argument("--weight-decay", type=float, default=4e-4)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=2024)
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--output-dir", type=Path, default=Path("runs/morphx"))
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = build_parser().parse_args(argv)
+    spec = get_cohort(args.cohort)
+    if args.dataset not in spec.clinical_files:
+        raise ValueError(f"{args.dataset} is not a valid dataset for {args.cohort}.")
+    spec.validate_training_dataset(args.dataset)
+    if args.model == "fusion" and args.micro_feature_dim is None:
+        raise ValueError("--micro-feature-dim is required for fusion training.")
+    if args.model == "fusion" and args.train_output != "sigmoid":
+        raise ValueError("--train-output logit is defined only for the MFM ablation")
+    if args.model == "fusion" and args.micro_feature_dim != spec.total_channels:
+        raise ValueError(f"MSFM requires {spec.total_channels} micro features for {spec.name}.")
+    if args.stage == "cv" and args.model == "fusion" and (
+        not args.micro_feature_template or not args.macro_checkpoint_template
+    ):
+        raise ValueError("Fusion CV requires --micro-feature-template and --macro-checkpoint-template.")
+    if args.stage == "final" and args.model == "fusion" and (
+        args.micro_features_csv is None or args.macro_checkpoint is None
+    ):
+        raise ValueError("Final fusion requires --micro-features-csv and --macro-checkpoint.")
+    if args.stage == "final" and args.epochs is None and args.cv_output_dir is None:
+        raise ValueError("Final training requires --cv-output-dir or an explicit --epochs.")
+    if args.stage == "final" and args.epochs is None:
+        args.epochs = _median_optimal_epochs(args.cv_output_dir, args.loss_function)
+    if args.epochs is None:
+        args.epochs = spec.macro_epochs if args.model == "macro" else spec.fusion_epochs
+    if args.learning_rate is None:
+        args.learning_rate = spec.macro_learning_rate if args.model == "macro" else spec.fusion_learning_rate
+    channel_indices, family_names = parse_feature_families(args.feature_families, spec)
+    args.data_root = args.data_root.resolve()
+    args.output_dir = args.output_dir.resolve()
+    args.splits_dir = (args.splits_dir or default_dataset_dir(args.data_root, spec, args.dataset)).resolve()
+    args.feature_map_dir = (
+        args.feature_map_dir
+        or _default_feature_map_dir(
+            args.data_root, spec, args.dataset, args.image_size
+        )
+    ).resolve()
+    if args.epochs < 1:
+        raise ValueError("--epochs must be positive")
+    if args.clinical_csv is None:
+        args.clinical_csv = None
     else:
-        best_macro_model = None
-
-    for fold in range(args.k_fold):
-        # Setup paths based on model type
-        if args.model_name == 'fusion':
-            args.patchs_feats_file = f'{args.base_dir}/{args.data_set_name}/topk_tiles_feats/all_wsi_feats_{args.patch_num}_key_patchs_ori_fold{best_macro_model[fold][0]}_{best_macro_model[fold][1]}th.csv'
-            args.macro_best_ckpt_path = f'{args.macro_ckpt_base_dir}/{best_macro_model[fold][0]}th/{best_macro_model[fold][1]}.pkl'
-
-        # Setup feature maps directory
-        if args.nor_method == 'initial':
-            args.final_save_dir = f'{args.base_dir}/{args.data_set_name}/processed_data/feature_maps/concat_feature_maps/{args.macro_input_channel_num}d/initial/final_feature_maps/{args.input_size}'
-        else:
-            args.final_save_dir = f'{args.base_dir}/{args.data_set_name}/processed_data/feature_maps/concat_feature_maps/{args.macro_input_channel_num}d/{args.nor_method}/fold_{fold}_final_feature_maps'
-
-        # Load split data
-        with open(os.path.join(args.split_data_dir, f'split_data_fold_{fold}.json'), 'r', encoding='utf-8-sig') as f:
-            data_set = json.load(f)
-
-        train_data = data_set["train_data"]
-        test_data = data_set["test_data"]
-
-        print(f'fold_{fold}:')
-        print(f"Train samples: {len(train_data)}")
-        print(f"Test samples: {len(test_data)}")
-
-        train(train_data, test_data, fold, args)
-
-    calculate_average_cindex(args)
-
-
-def parse_args():
-
-    parser = argparse.ArgumentParser(description="WSI Survival Analysis")
-
-    # Data parameters
-    parser.add_argument("--input_data_type", default='8+40+120',
-                        help="Input data type/feature combination")
-    parser.add_argument("--input_size", default=256, type=int,
-                        help="Input image size")
-    parser.add_argument("--nor_method", default='initial',
-                        help="Normalization method: initial, maxmin, zscore")
-    parser.add_argument("--data_set_name", default='TCGA',
-                        help="Dataset name")
-    parser.add_argument("--k_fold", default=10, type=int,
-                        help="Number of folds for cross-validation")
-    parser.add_argument("--base_dir",
-                        default='HCC_path',
-                        help="Path to base data directory")
-    parser.add_argument("--macro_ckpt_base_dir",
-                        default='train_log_TCGA_256_macro_8+40+120_6.6e-4',
-                        help="Base directory for macro model checkpoints")
-
-    # Model parameters
-    parser.add_argument("--model_name", default="macro",
-                        choices=["macro", "fusion"],
-                        help="Model type")
-    parser.add_argument("--freeze_macro_part", default=False, type=bool,
-                        help="Freeze macro part in fusion model")
-    parser.add_argument("--macro_first_covd_param", nargs='+', type=int,
-                        default=[3, 2, 1],
-                        help="Macro model first conv params")
-    parser.add_argument("--macro_input_channel_num", default=168, type=int,
-                        help="Macro model input channels")
-    parser.add_argument("--output_use_sigmoid", default=True, type=bool,
-                        help="Use sigmoid in output")
-    parser.add_argument("--loss_function", default="modified_cox_loss",
-                        choices=["modified_cox_loss", "cox_loss"],
-                        help="Loss function")
-    parser.add_argument("--patch_num", default=64, type=int,
-                        help="Number of patches (for fusion model)")
-    parser.add_argument("--best_macro_models",
-                        default="0:5,1:6,2:2,3:13,4:13,5:10,6:14,7:12,8:7,9:13",
-                        help="Best macro models for fusion training as 'fold:epoch' pairs")
-
-    # Path parameters
-    parser.add_argument("--macro_best_ckpt_path", default=None,
-                        help="Path to best macro model checkpoint (for fusion)")
-    parser.add_argument("--patchs_feats_file", default='',
-                        help="Path to patch features file (for fusion)")
-    parser.add_argument("--mircro_dir", default='',
-                        help="Alternative path to micro features (for fusion)")
-    parser.add_argument("--train_log_dir",
-                        default='data',
-                        help="Training log directory")
-    parser.add_argument("--final_save_dir", default='',
-                        help="Final feature maps directory")
-
-    # Training parameters
-    parser.add_argument("--epochs", default=20, type=int,
-                        help="Number of training epochs")
-    parser.add_argument("--batch_size", default=10, type=int,
-                        help="Batch size")
-    parser.add_argument("--lr", default=6.6e-4, type=float,
-                        help="Learning rate")
-    parser.add_argument("--patience", default=1, type=float,
-                        help="Patience for LR scheduler")
-
-    # Device
-    parser.add_argument("--device", default="cuda:0",
-                        help="Device to use")
-
-    args = parser.parse_args()
-    args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    return args
-
-
-if __name__ == '__main__':
-    args = parse_args()
-
-    if args.model_name == 'fusion':
-        for patch_num in [args.patch_num]:  # Now using the patch_num from args
-            args.patch_num = patch_num
-            train_k_folds(args)
+        args.clinical_csv = args.clinical_csv.resolve()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with (args.output_dir / "run_config.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                **vars(args),
+                "selected_feature_families": family_names,
+                "selected_channel_indices": channel_indices,
+            },
+            handle,
+            indent=2,
+            default=_json_default,
+        )
+    _seed_everything(args.seed)
+    device = torch.device(args.device if args.device.startswith("cuda") and torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    print(f"Feature families: {family_names}; channels: {len(channel_indices)}")
+    print(f"Trainable parameters are reported per fold.")
+    if args.stage == "final":
+        train_final(args, device, spec, channel_indices)
     else:
-        train_k_folds(args)
+        results = []
+        for fold in args.folds:
+            _seed_everything(args.seed)
+            result = train_fold(args, fold, device, spec, channel_indices)
+            results.append({"fold": fold, "best_cindex": result})
+        with (args.output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+            json.dump(results, handle, indent=2, default=_json_default)
+
+
+if __name__ == "__main__":
+    main()
